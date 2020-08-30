@@ -6,24 +6,12 @@ const errors = require('@tryghost/errors');
 const config = require('../../../shared/config');
 const models = require('../../models');
 const membersService = require('../../services/members');
+const doImport = require('../../services/members/importer');
 const settingsCache = require('../../services/settings/cache');
 const {i18n} = require('../../lib/common');
 const logging = require('../../../shared/logging');
-const fsLib = require('../../lib/fs');
 const db = require('../../data/db');
 const _ = require('lodash');
-
-const decorateWithSubscriptions = async function (member) {
-    // NOTE: this logic is here until relations between Members/MemberStripeCustomer/StripeCustomerSubscription
-    //       are in place
-    const subscriptions = await membersService.api.members.getStripeSubscriptions(member);
-
-    return Object.assign(member, {
-        stripe: {
-            subscriptions
-        }
-    });
-};
 
 /** NOTE: this method should not exist at all and needs to be cleaned up
     it was created due to a bug in how CSV is currently created for exports
@@ -38,8 +26,68 @@ const cleanupUndefined = (obj) => {
     }
 };
 
-// NOTE: this method can be removed once unique constraints are introduced ref.: https://github.com/TryGhost/Ghost/blob/e277c6b/core/server/data/schema/schema.js#L339
-const sanitizeInput = (members) => {
+const sanitizeInput = async (members) => {
+    const validationErrors = [];
+    let invalidCount = 0;
+
+    const jsonSchema = require('./utils/validators/utils/json-schema');
+    const schema = require('./utils/validators/input/schemas/members-upload');
+    const definitions = require('./utils/validators/input/schemas/members');
+
+    let invalidValidationCount = 0;
+    try {
+        await jsonSchema.validate(schema, definitions, members);
+    } catch (error) {
+        if (error.errorDetails && error.errorDetails.length) {
+            const jsonPointerIndexRegex = /\[(?<index>\d+)\]/;
+
+            let invalidRecordIndexes = error.errorDetails.map((errorDetail) => {
+                if (errorDetail.dataPath) {
+                    const key = errorDetail.dataPath.split('.').pop();
+                    const [, index] = errorDetail.dataPath.match(jsonPointerIndexRegex);
+                    validationErrors.push(new errors.ValidationError({
+                        message: i18n.t('notices.data.validation.index.schemaValidationFailed', {
+                            key
+                        }),
+                        context: `${key} ${errorDetail.message}`,
+                        errorDetails: `${errorDetail.dataPath} with value ${members[index][key]}`
+                    }));
+
+                    return Number(index);
+                }
+            });
+
+            invalidRecordIndexes = _.uniq(invalidRecordIndexes);
+            invalidRecordIndexes = invalidRecordIndexes.filter(index => (index !== undefined));
+
+            invalidRecordIndexes.forEach((index) => {
+                members[index] = undefined;
+            });
+            members = members.filter(record => (record !== undefined));
+            invalidValidationCount += invalidRecordIndexes.length;
+        }
+    }
+
+    invalidCount += invalidValidationCount;
+
+    const stripeIsConnected = membersService.config.isStripeConnected();
+    const hasStripeConnectedMembers = members.find(member => (member.stripe_customer_id || member.comped));
+
+    if (!stripeIsConnected && hasStripeConnectedMembers) {
+        let nonFilteredMembersCount = members.length;
+        members = members.filter(member => !(member.stripe_customer_id || member.comped));
+
+        const stripeConnectedMembers = (nonFilteredMembersCount - members.length);
+        if (stripeConnectedMembers) {
+            invalidCount += stripeConnectedMembers;
+            validationErrors.push(new errors.ValidationError({
+                message: i18n.t('errors.api.members.stripeNotConnected.message'),
+                context: i18n.t('errors.api.members.stripeNotConnected.context'),
+                help: i18n.t('errors.api.members.stripeNotConnected.help')
+            }));
+        }
+    }
+
     const customersMap = members.reduce((acc, member) => {
         if (member.stripe_customer_id && member.stripe_customer_id !== 'undefined') {
             if (acc[member.stripe_customer_id]) {
@@ -63,11 +111,30 @@ const sanitizeInput = (members) => {
         return !(toRemove.includes(member.stripe_customer_id));
     });
 
-    return sanitized;
+    const duplicateStripeCustomersCount = (members.length - sanitized.length);
+    if (duplicateStripeCustomersCount) {
+        validationErrors.push(new errors.ValidationError({
+            message: i18n.t('errors.api.members.duplicateStripeCustomerIds.message'),
+            context: i18n.t('errors.api.members.duplicateStripeCustomerIds.context'),
+            help: i18n.t('errors.api.members.duplicateStripeCustomerIds.help')
+        }));
+    }
+
+    invalidCount += duplicateStripeCustomersCount;
+
+    return {
+        sanitized,
+        invalidCount,
+        validationErrors
+    };
 };
 
 function serializeMemberLabels(labels) {
     if (_.isString(labels)) {
+        if (labels === '') {
+            return [];
+        }
+
         return [{
             name: labels.trim()
         }];
@@ -86,43 +153,62 @@ function serializeMemberLabels(labels) {
     return [];
 }
 
-const listMembers = async function (options) {
-    const res = (await models.Member.findPage(options));
-    const memberModels = res.data.map(model => model.toJSON(options));
-
-    const members = await Promise.all(memberModels.map(async function (member) {
-        return decorateWithSubscriptions(member);
-    }));
-
-    return {
-        members: members,
-        meta: res.meta
-    };
-};
-
-const createLabels = async (labels, options) => {
+const findOrCreateLabels = async (labels, options) => {
     const api = require('./index');
 
     return await Promise.all(labels.map((label) => {
-        return api.labels.add.query({
-            data: {
-                labels: [label]
-            },
-            options: {
-                context: options.context
-            }
-        }).catch((error) => {
-            if (error.errorType === 'ValidationError') {
-                return;
+        return models.Label.findOne({name: label.name}).then((existingLabel) => {
+            if (existingLabel) {
+                return existingLabel;
             }
 
-            throw error;
+            return api.labels.add.query({
+                data: {
+                    labels: [label]
+                },
+                options: {
+                    context: options.context
+                }
+            }).catch((error) => {
+                if (error.errorType === 'ValidationError') {
+                    return;
+                }
+
+                throw error;
+            });
         });
     }));
 };
 
-const members = {
+const getUniqueMemberLabels = (members) => {
+    const allLabels = [];
+
+    members.forEach((member) => {
+        const labels = (member.labels && member.labels.split(',')) || [];
+
+        if (labels.length) {
+            allLabels.push(...labels);
+        }
+    });
+
+    return _.uniq(allLabels);
+};
+
+module.exports = {
     docName: 'members',
+
+    hasActiveStripeSubscriptions: {
+        permissions: {
+            method: 'browse'
+        },
+        async query() {
+            const hasActiveStripeSubscriptions = await membersService.api.hasActiveStripeSubscriptions();
+            return {
+                hasActiveStripeSubscriptions
+            };
+        }
+    },
+
     browse: {
         options: [
             'limit',
@@ -137,7 +223,14 @@ const members = {
         permissions: true,
         validation: {},
         async query(frame) {
-            return listMembers(frame.options);
+            frame.options.withRelated = ['labels', 'stripeSubscriptions', 'stripeSubscriptions.customer'];
+            const page = await membersService.api.members.list(frame.options);
+            const members = page.data.map(model => model.toJSON(frame.options));
+
+            return {
+                members: members,
+                meta: page.meta
+            };
         }
     },
 
@@ -150,7 +243,8 @@ const members = {
         validation: {},
         permissions: true,
         async query(frame) {
-            let model = await models.Member.findOne(frame.data, frame.options);
+            frame.options.withRelated = ['labels', 'stripeSubscriptions', 'stripeSubscriptions.customer'];
+            let model = await membersService.api.members.get(frame.data, frame.options);
 
             if (!model) {
                 throw new errors.NotFoundError({
@@ -158,9 +252,7 @@ const members = {
                 });
             }
 
-            const member = model.toJSON(frame.options);
-
-            return decorateWithSubscriptions(member);
+            return model.toJSON(frame.options);
         }
     },
 
@@ -183,12 +275,10 @@ const members = {
         },
         permissions: true,
         async query(frame) {
-            let model;
-
+            let member;
+            frame.options.withRelated = ['stripeSubscriptions', 'stripeSubscriptions.customer'];
             try {
-                model = await models.Member.add(frame.data.members[0], frame.options);
-
-                const member = model.toJSON(frame.options);
+                member = await membersService.api.members.create(frame.data.members[0], frame.options);
 
                 if (frame.data.members[0].stripe_customer_id) {
                     if (!membersService.config.isStripeConnected()) {
@@ -207,32 +297,32 @@ const members = {
                 }
 
                 if (frame.options.send_email) {
-                    await membersService.api.sendEmailWithMagicLink({email: model.get('email'), requestedType: frame.options.email_type});
+                    await membersService.api.sendEmailWithMagicLink({email: member.get('email'), requestedType: frame.options.email_type});
                 }
 
-                return decorateWithSubscriptions(member);
+                return member.toJSON(frame.options);
             } catch (error) {
                 if (error.code && error.message.toLowerCase().indexOf('unique') !== -1) {
-                    throw new errors.ValidationError({message: i18n.t('errors.api.members.memberAlreadyExists')});
+                    throw new errors.ValidationError({
+                        message: i18n.t('errors.models.member.memberAlreadyExists.message'),
+                        context: i18n.t('errors.models.member.memberAlreadyExists.context')
+                    });
                 }
 
-                // NOTE: failed to link Stripe customer/plan/subscription
-                const isStripeLinkingError = error.message && error.message.match(/customer|plan|subscription|Stripe account/g);
-                if (model && isStripeLinkingError) {
+                // NOTE: failed to link Stripe customer/plan/subscription or have thrown custom Stripe connection error.
+                //       It's a bit ugly doing regex matching to detect errors, but it's the easiest way that works without
+                //       introducing additional logic/data format into current error handling
+                const isStripeLinkingError = error.message && (error.message.match(/customer|plan|subscription/g) || error.context === i18n.t('errors.api.members.stripeNotConnected.context'));
+                if (member && isStripeLinkingError) {
                     if (error.message.indexOf('customer') && error.code === 'resource_missing') {
                         error.message = `Member not imported. ${error.message}`;
                         error.context = i18n.t('errors.api.members.stripeCustomerNotFound.context');
                         error.help = i18n.t('errors.api.members.stripeCustomerNotFound.help');
                     }
 
-                    const api = require('./index');
-
-                    await api.members.destroy.query({
-                        options: {
-                            context: frame.options.context,
-                            id: model.id
-                        }
-                    });
+                    await membersService.api.members.destroy({
+                        id: member.get('id')
+                    }, frame.options);
                 }
 
                 throw error;
@@ -255,24 +345,70 @@ const members = {
         },
         permissions: true,
         async query(frame) {
-            const model = await models.Member.edit(frame.data.members[0], frame.options);
+            frame.options.withRelated = ['stripeSubscriptions'];
+            const member = await membersService.api.members.update(frame.data.members[0], frame.options);
 
-            const member = model.toJSON(frame.options);
+            const hasCompedSubscription = !!member.related('stripeSubscriptions').find(subscription => subscription.get('plan_nickname') === 'Complimentary');
 
-            const subscriptions = await membersService.api.members.getStripeSubscriptions(member);
-            const compedSubscriptions = subscriptions.filter(sub => (sub.plan.nickname === 'Complimentary'));
-
-            if (frame.data.members[0].comped !== undefined && (frame.data.members[0].comped !== compedSubscriptions)) {
-                const hasCompedSubscription = !!(compedSubscriptions.length);
-
+            if (typeof frame.data.members[0].comped === 'boolean') {
                 if (frame.data.members[0].comped && !hasCompedSubscription) {
                     await membersService.api.members.setComplimentarySubscription(member);
                 } else if (!(frame.data.members[0].comped) && hasCompedSubscription) {
                     await membersService.api.members.cancelComplimentarySubscription(member);
                 }
+
+                await member.load(['stripeSubscriptions']);
             }
 
-            return decorateWithSubscriptions(member);
+            await member.load(['stripeSubscriptions.customer']);
+
+            return member.toJSON(frame.options);
+        }
+    },
+
+    editSubscription: {
+        statusCode: 200,
+        headers: {},
+        options: [
+            'id',
+            'subscription_id'
+        ],
+        data: [
+            'cancel_at_period_end'
+        ],
+        validation: {
+            options: {
+                id: {
+                    required: true
+                },
+                subscription_id: {
+                    required: true
+                }
+            },
+            data: {
+                cancel_at_period_end: {
+                    required: true
+                }
+            }
+        },
+        permissions: {
+            method: 'edit'
+        },
+        async query(frame) {
+            await membersService.api.members.updateSubscription(frame.options.id, {
+                subscriptionId: frame.options.subscription_id,
+                cancelAtPeriodEnd: frame.data.cancel_at_period_end
+            });
+            let model = await membersService.api.members.get({id: frame.options.id}, {
+                withRelated: ['labels', 'stripeSubscriptions', 'stripeSubscriptions.customer']
+            });
+            if (!model) {
+                throw new errors.NotFoundError({
+                    message: i18n.t('errors.api.members.memberNotFound')
+                });
+            }
+
+            return model.toJSON(frame.options);
         }
     },
 
@@ -280,7 +416,8 @@ const members = {
         statusCode: 204,
         headers: {},
         options: [
-            'id'
+            'id',
+            'cancel'
         ],
         validation: {
             options: {
@@ -292,28 +429,17 @@ const members = {
         permissions: true,
         async query(frame) {
             frame.options.require = true;
+            frame.options.cancelStripeSubscriptions = frame.options.cancel;
 
-            let member = await models.Member.findOne(frame.options);
-
-            if (!member) {
+            await Promise.resolve(membersService.api.members.destroy({
+                id: frame.options.id
+            }, frame.options)).catch(models.Member.NotFoundError, () => {
                 throw new errors.NotFoundError({
                     message: i18n.t('errors.api.resource.resourceNotFound', {
                         resource: 'Member'
                     })
                 });
-            }
-
-            // NOTE: move to a model layer once Members/MemberStripeCustomer relations are in place
-            await membersService.api.members.destroyStripeSubscriptions(member);
-
-            await models.Member.destroy(frame.options)
-                .catch(models.Member.NotFoundError, () => {
-                    throw new errors.NotFoundError({
-                        message: i18n.t('errors.api.resource.resourceNotFound', {
-                            resource: 'Member'
-                        })
-                    });
-                });
+            });
 
             return null;
         }
@@ -340,8 +466,14 @@ const members = {
         },
         validation: {},
         async query(frame) {
-            frame.options.withRelated = ['labels'];
-            return listMembers(frame.options);
+            frame.options.withRelated = ['labels', 'stripeSubscriptions', 'stripeSubscriptions.customer'];
+            const page = await membersService.api.members.list(frame.options);
+            const members = page.data.map(model => model.toJSON(frame.options));
+
+            return {
+                members: members,
+                meta: page.meta
+            };
         }
     },
 
@@ -387,7 +519,6 @@ const members = {
             method: 'add'
         },
         async query(frame) {
-            let filePath = frame.file.path;
             let imported = {
                 count: 0
             };
@@ -397,51 +528,33 @@ const members = {
             };
             let duplicateStripeCustomerIdCount = 0;
 
-            const columnsToExtract = [{
-                name: 'email',
-                lookup: /^email/i
-            }, {
-                name: 'name',
-                lookup: /name/i
-            }, {
-                name: 'note',
-                lookup: /note/i
-            }, {
-                name: 'subscribed_to_emails',
-                lookup: /subscribed_to_emails/i
-            }, {
-                name: 'stripe_customer_id',
-                lookup: /stripe_customer_id/i
-            }, {
-                name: 'complimentary_plan',
-                lookup: /complimentary_plan/i
-            }, {
-                name: 'labels',
-                lookup: /labels/i
-            }, {
-                name: 'created_at',
-                lookup: /created_at/i
-            }];
-
             // NOTE: custom labels have to be created in advance otherwise there are conflicts
             //       when processing member creation in parallel later on in import process
             const importSetLabels = serializeMemberLabels(frame.data.labels);
-            await createLabels(importSetLabels, frame.options);
+            await findOrCreateLabels(importSetLabels, frame.options);
 
-            return fsLib.readCSV({
-                path: filePath,
-                columnsToExtract: columnsToExtract
-            }).then((result) => {
-                const sanitized = sanitizeInput(result);
-                duplicateStripeCustomerIdCount = result.length - sanitized.length;
-                invalid.count += duplicateStripeCustomerIdCount;
+            // NOTE: adding an import label allows for imports to be "undone" via bulk delete
+            let importLabel;
+            if (frame.data.members.length) {
+                const siteTimezone = settingsCache.get('timezone');
+                const name = `Import ${moment().tz(siteTimezone).format('YYYY-MM-DD HH:mm')}`;
+                const result = await findOrCreateLabels([{name}], frame.options);
+                importLabel = result[0] && result[0].toJSON();
 
-                if (duplicateStripeCustomerIdCount) {
-                    invalid.errors.push(new errors.ValidationError({
-                        message: i18n.t('errors.api.members.duplicateStripeCustomerIds.message'),
-                        context: i18n.t('errors.api.members.duplicateStripeCustomerIds.context'),
-                        help: i18n.t('errors.api.members.duplicateStripeCustomerIds.help')
-                    }));
+                importSetLabels.push(importLabel);
+            }
+
+            // NOTE: member-specific labels have to be pre-created as they cause conflicts when processed
+            //       in parallel
+            const memberLabels = serializeMemberLabels(getUniqueMemberLabels(frame.data.members));
+            await findOrCreateLabels(memberLabels, frame.options);
+
+            return Promise.resolve().then(async () => {
+                const {sanitized, invalidCount, validationErrors} = await sanitizeInput(frame.data.members);
+                invalid.count += invalidCount;
+
+                if (validationErrors.length) {
+                    invalid.errors.push(...validationErrors);
                 }
 
                 return Promise.map(sanitized, ((entry) => {
@@ -488,19 +601,19 @@ const members = {
                             //       for this reason we have to make sure any unexpected errors are logged here
                             if (Array.isArray(error)) {
                                 logging.error(error[0]);
+                                invalid.errors.push(...error);
                             } else {
                                 logging.error(error);
+                                invalid.errors.push(error);
                             }
 
                             invalid.count = invalid.count + 1;
-
-                            invalid.errors.push(error);
                         }
                     });
-            }).then(() => {
+            }).then(async () => {
                 // NOTE: grouping by context because messages can contain unique data like "customer_id"
                 const groupedErrors = _.groupBy(invalid.errors, 'context');
-                const uniqueErrors = _.uniq(invalid.errors, 'context');
+                const uniqueErrors = _.uniqBy(invalid.errors, 'context');
 
                 const outputErrors = uniqueErrors.map((error) => {
                     let errorGroup = groupedErrors[error.context];
@@ -521,12 +634,130 @@ const members = {
 
                 invalid.errors = outputErrors;
 
+                if (imported.count === 0 && importLabel) {
+                    await models.Label.destroy(Object.assign({}, {id: importLabel.id}, frame.options));
+                    importLabel = null;
+                }
+
                 return {
                     meta: {
                         stats: {
-                            imported: imported,
-                            invalid: invalid
-                        }
+                            imported,
+                            invalid
+                        },
+                        import_label: importLabel
+                    }
+                };
+            });
+        }
+    },
+
+    importCSVBatched: {
+        statusCode: 201,
+        permissions: {
+            method: 'add'
+        },
+        async query(frame) {
+            let imported = {
+                count: 0
+            };
+            let invalid = {
+                count: 0,
+                errors: []
+            };
+            let duplicateStripeCustomerIdCount = 0;
+
+            // NOTE: redacted copy from models.Base module
+            const contextUser = (options) => {
+                options = options || {};
+                options.context = options.context || {};
+
+                if (options.context.user || models.Base.Model.isExternalUser(options.context.user)) {
+                    return options.context.user;
+                } else if (options.context.integration) {
+                    return models.Base.Model.internalUser;
+                }
+            };
+
+            const createdBy = contextUser(frame.options);
+
+            // NOTE: custom labels have to be created in advance otherwise there are conflicts
+            //       when processing member creation in parallel later on in import process
+            const importSetLabels = serializeMemberLabels(frame.data.labels);
+
+            // NOTE: adding an import label allows for imports to be "undone" via bulk delete
+            let importLabel;
+            if (frame.data.members.length) {
+                const siteTimezone = settingsCache.get('timezone');
+                const name = `Import ${moment().tz(siteTimezone).format('YYYY-MM-DD HH:mm')}`;
+                const result = await findOrCreateLabels([{name}], frame.options);
+                importLabel = result[0] && result[0].toJSON();
+
+                importSetLabels.push(importLabel);
+            }
+
+            const importSetLabelModels = await findOrCreateLabels(importSetLabels, frame.options);
+
+            // NOTE: member-specific labels have to be pre-created as they cause conflicts when processed
+            //       in parallel
+            const memberLabels = serializeMemberLabels(getUniqueMemberLabels(frame.data.members));
+            const memberLabelModels = await findOrCreateLabels(memberLabels, frame.options);
+
+            const allLabelModels = [...importSetLabelModels, ...memberLabelModels].filter(model => model !== undefined);
+
+            return Promise.resolve().then(async () => {
+                const {sanitized, invalidCount, validationErrors} = await sanitizeInput(frame.data.members);
+                invalid.count += invalidCount;
+
+                if (validationErrors.length) {
+                    invalid.errors.push(...validationErrors);
+                }
+
+                return doImport({
+                    members: sanitized,
+                    allLabelModels,
+                    importSetLabels,
+                    createdBy
+                });
+            }).then(async (result) => {
+                invalid.errors = invalid.errors.concat(result.invalid.errors);
+                invalid.count += result.invalid.count;
+                imported.count += result.imported.count;
+                // NOTE: grouping by context because messages can contain unique data like "customer_id"
+                const groupedErrors = _.groupBy(invalid.errors, 'context');
+                const uniqueErrors = _.uniqBy(invalid.errors, 'context');
+
+                const outputErrors = uniqueErrors.map((error) => {
+                    let errorGroup = groupedErrors[error.context];
+                    let errorCount = errorGroup.length;
+
+                    if (error.message === i18n.t('errors.api.members.duplicateStripeCustomerIds.message')) {
+                        errorCount = duplicateStripeCustomerIdCount;
+                    }
+
+                    // NOTE: filtering only essential error information, so API doesn't leak more error details than it should
+                    return {
+                        message: error.message,
+                        context: error.context,
+                        help: error.help,
+                        count: errorCount
+                    };
+                });
+
+                invalid.errors = outputErrors;
+
+                if (imported.count === 0 && importLabel) {
+                    await models.Label.destroy(Object.assign({}, {id: importLabel.id}, frame.options));
+                    importLabel = null;
+                }
+
+                return {
+                    meta: {
+                        stats: {
+                            imported,
+                            invalid
+                        },
+                        import_label: importLabel
                     }
                 };
             });
@@ -550,7 +781,7 @@ const members = {
         async query(frame) {
             const dateFormat = 'YYYY-MM-DD HH:mm:ss';
             const isSQLite = config.get('database:client') === 'sqlite3';
-            const siteTimezone = settingsCache.get('active_timezone');
+            const siteTimezone = settingsCache.get('timezone');
             const tzOffsetMins = moment.tz(siteTimezone).utcOffset();
 
             const days = frame.options.days === 'all-time' ? 'all-time' : Number(frame.options.days || 30);
@@ -653,5 +884,9 @@ const members = {
         }
     }
 };
-
-module.exports = members;
+// NOTE: remove below condition once batched import is production ready,
+//       remember to swap out current importCSV method when doing so
+if (config.get('enableDeveloperExperiments')) {
+    module.exports.importCSV = module.exports.importCSVBatched;
+    delete module.exports.importCSVBatched;
+}

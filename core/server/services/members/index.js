@@ -9,6 +9,7 @@ const urlUtils = require('../../../shared/url-utils');
 const settingsCache = require('../settings/cache');
 const config = require('../../../shared/config');
 const ghostVersion = require('../../lib/ghost-version');
+const _ = require('lodash');
 
 const membersConfig = new MembersConfigProvider({
     config,
@@ -21,12 +22,7 @@ const membersConfig = new MembersConfigProvider({
 let membersApi;
 let membersSettings;
 
-// Bind to events to automatically keep subscription info up-to-date from settings
-events.on('settings.edited', function updateSettingFromModel(settingModel) {
-    if (!['members_subscription_settings', 'stripe_connect_integration'].includes(settingModel.get('key'))) {
-        return;
-    }
-
+function reconfigureMembersAPI() {
     const reconfiguredMembersAPI = createMembersApiInstance(membersConfig);
     reconfiguredMembersAPI.bus.on('ready', function () {
         membersApi = reconfiguredMembersAPI;
@@ -34,10 +30,35 @@ events.on('settings.edited', function updateSettingFromModel(settingModel) {
     reconfiguredMembersAPI.bus.on('error', function (err) {
         logging.error(err);
     });
+}
+
+const debouncedReconfigureMembersAPI = _.debounce(reconfigureMembersAPI, 600);
+
+// Bind to events to automatically keep subscription info up-to-date from settings
+events.on('settings.edited', function updateSettingFromModel(settingModel) {
+    if (![
+        'members_allow_free_signup',
+        'members_from_address',
+        'stripe_publishable_key',
+        'stripe_secret_key',
+        'stripe_product_name',
+        'stripe_plans',
+        'stripe_connect_publishable_key',
+        'stripe_connect_secret_key',
+        'stripe_connect_livemode',
+        'stripe_connect_display_name',
+        'stripe_connect_account_id'
+    ].includes(settingModel.get('key'))) {
+        return;
+    }
+
+    debouncedReconfigureMembersAPI();
 });
 
 const membersService = {
     contentGating: require('./content-gating'),
+
+    checkHostLimit: require('./limit'),
 
     config: membersConfig,
 

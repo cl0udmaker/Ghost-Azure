@@ -48,6 +48,16 @@ const configureGrunt = function (grunt) {
     grunt.loadNpmTasks('grunt-subgrunt');
     grunt.loadNpmTasks('grunt-update-submodules');
 
+    /** This little bit of weirdness gives the express server chance to shutdown properly */
+    const waitBeforeExit = () => {
+        setTimeout(() => {
+            process.exit(0);
+        }, 1000);
+    };
+
+    process.on('SIGINT', waitBeforeExit);
+    process.on('SIGTERM', waitBeforeExit);
+
     const cfg = {
         // #### Common paths used by tasks
         paths: {
@@ -127,7 +137,6 @@ const configureGrunt = function (grunt) {
                 reporter: grunt.option('reporter') || 'spec',
                 timeout: '60000',
                 require: ['core/server/overrides'],
-                retries: '3',
                 exit: true
             },
 

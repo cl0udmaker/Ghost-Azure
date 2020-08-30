@@ -40,6 +40,9 @@ function addTableColumn(tableName, table, columnName, columnSpec = schema[tableN
         // check if table exists?
         column.references(columnSpec.references);
     }
+    if (Object.prototype.hasOwnProperty.call(columnSpec, 'cascadeDelete') && columnSpec.cascadeDelete === true) {
+        column.onDelete('CASCADE');
+    }
     if (Object.prototype.hasOwnProperty.call(columnSpec, 'defaultTo')) {
         column.defaultTo(columnSpec.defaultTo);
     }
@@ -54,20 +57,20 @@ function addColumn(tableName, column, transaction, columnSpec) {
     });
 }
 
-function dropColumn(table, column, transaction) {
-    return (transaction || db.knex).schema.table(table, function (table) {
+function dropColumn(tableName, column, transaction) {
+    return (transaction || db.knex).schema.table(tableName, function (table) {
         table.dropColumn(column);
     });
 }
 
-function addUnique(table, column, transaction) {
-    return (transaction || db.knex).schema.table(table, function (table) {
+function addUnique(tableName, column, transaction) {
+    return (transaction || db.knex).schema.table(tableName, function (table) {
         table.unique(column);
     });
 }
 
-function dropUnique(table, column, transaction) {
-    return (transaction || db.knex).schema.table(table, function (table) {
+function dropUnique(tableName, column, transaction) {
+    return (transaction || db.knex).schema.table(tableName, function (table) {
         table.dropUnique(column);
     });
 }
@@ -152,7 +155,7 @@ function createColumnMigration(...migrations) {
 
         const log = createLog(isInCorrectState ? 'warn' : 'info');
 
-        log(`${operationVerb} ${table}.${column}`);
+        log(`${operationVerb} ${table}.${column} column`);
 
         if (!isInCorrectState) {
             await operation(table, column, conn, columnDefinition);

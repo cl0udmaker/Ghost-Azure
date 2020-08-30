@@ -10,16 +10,6 @@ module.exports = {
         headers: {},
         options: [],
         data: [],
-        validation: {
-            data: {
-                event: {
-                    required: true
-                },
-                target_url: {
-                    required: true
-                }
-            }
-        },
         permissions: true,
         query(frame) {
             return models.Webhook.getByEventAndTarget(
@@ -39,7 +29,33 @@ module.exports = {
     },
 
     edit: {
-        permissions: true,
+        permissions: {
+            before: (frame) => {
+                if (frame.options.context && frame.options.context.integration && frame.options.context.integration.id) {
+                    return models.Webhook.findOne({id: frame.options.id})
+                        .then((webhook) => {
+                            if (!webhook) {
+                                throw new errors.NotFoundError({
+                                    message: i18n.t('errors.api.resource.resourceNotFound', {
+                                        resource: 'Webhook'
+                                    })
+                                });
+                            }
+
+                            if (webhook.get('integration_id') !== frame.options.context.integration.id) {
+                                throw new errors.NoPermissionError({
+                                    message: i18n.t('errors.api.webhooks.noPermissionToEdit.message', {
+                                        method: 'edit'
+                                    }),
+                                    context: i18n.t('errors.api.webhooks.noPermissionToEdit.context', {
+                                        method: 'edit'
+                                    })
+                                });
+                            }
+                        });
+                }
+            }
+        },
         data: [
             'name',
             'event',
@@ -82,7 +98,33 @@ module.exports = {
                 }
             }
         },
-        permissions: true,
+        permissions: {
+            before: (frame) => {
+                if (frame.options.context && frame.options.context.integration && frame.options.context.integration.id) {
+                    return models.Webhook.findOne({id: frame.options.id})
+                        .then((webhook) => {
+                            if (!webhook) {
+                                throw new errors.NotFoundError({
+                                    message: i18n.t('errors.api.resource.resourceNotFound', {
+                                        resource: 'Webhook'
+                                    })
+                                });
+                            }
+
+                            if (webhook.get('integration_id') !== frame.options.context.integration.id) {
+                                throw new errors.NoPermissionError({
+                                    message: i18n.t('errors.api.webhooks.noPermissionToEdit.message', {
+                                        method: 'destroy'
+                                    }),
+                                    context: i18n.t('errors.api.webhooks.noPermissionToEdit.context', {
+                                        method: 'destroy'
+                                    })
+                                });
+                            }
+                        });
+                }
+            }
+        },
         query(frame) {
             frame.options.require = true;
 

@@ -72,7 +72,7 @@ const updateMemberData = async function (req, res) {
         const member = await membersService.ssr.getMemberDataFromSession(req, res);
         if (member) {
             const updatedMember = await membersService.api.members.update(data, {id: member.id});
-            res.json(formattedMemberResponse(updatedMember));
+            res.json(formattedMemberResponse(updatedMember.toJSON()));
         } else {
             res.json(null);
         }
@@ -84,27 +84,30 @@ const updateMemberData = async function (req, res) {
 };
 
 const getMemberSiteData = async function (req, res) {
-    const stripePaymentProcessor = settingsCache.get('members_subscription_settings').paymentProcessors.find(
-        paymentProcessor => paymentProcessor.adapter === 'stripe'
-    );
-    const stripeSecretToken = stripePaymentProcessor && stripePaymentProcessor.config.secret_token;
-    const stripePublicToken = stripePaymentProcessor && stripePaymentProcessor.config.public_token;
-    const isStripeConfigured = (!!stripeSecretToken && stripeSecretToken !== '' && !!stripePublicToken && stripePublicToken !== '');
+    const isStripeConfigured = membersService.config.isStripeConnected();
+
     const response = {
         title: settingsCache.get('title'),
         description: settingsCache.get('description'),
         logo: settingsCache.get('logo'),
-        brand: settingsCache.get('brand'),
+        icon: settingsCache.get('icon'),
+        accent_color: settingsCache.get('accent_color'),
         url: urlUtils.urlFor('home', true),
         version: ghostVersion.safe,
         plans: membersService.config.getPublicPlans(),
-        allowSelfSignup: membersService.config.getAllowSelfSignup(),
-        isStripeConfigured
+        allow_self_signup: membersService.config.getAllowSelfSignup(),
+        is_stripe_configured: isStripeConfigured,
+        portal_button: settingsCache.get('portal_button'),
+        portal_name: settingsCache.get('portal_name'),
+        portal_plans: settingsCache.get('portal_plans'),
+        portal_button_icon: settingsCache.get('portal_button_icon'),
+        portal_button_signup_text: settingsCache.get('portal_button_signup_text'),
+        portal_button_style: settingsCache.get('portal_button_style')
     };
 
-    // Brand is currently an experimental feature
+    // accent_color is currently an experimental feature
     if (!config.get('enableDeveloperExperiments')) {
-        delete response.brand;
+        delete response.accent_color;
     }
 
     res.json({site: response});

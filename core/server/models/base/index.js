@@ -18,7 +18,7 @@ const db = require('../../data/db');
 const {events, i18n} = require('../../lib/common');
 const logging = require('../../../shared/logging');
 const errors = require('@tryghost/errors');
-const security = require('../../lib/security');
+const security = require('@tryghost/security');
 const schema = require('../../data/schema');
 const urlUtils = require('../../../shared/url-utils');
 const validation = require('../../data/validation');
@@ -696,7 +696,7 @@ ghostBookshelf.Model = ghostBookshelf.Model.extend({
         case 'findAll':
             return baseOptions.concat(extraOptions, ['filter', 'columns', 'mongoTransformer']);
         case 'findPage':
-            return baseOptions.concat(extraOptions, ['filter', 'order', 'page', 'limit', 'columns', 'mongoTransformer']);
+            return baseOptions.concat(extraOptions, ['filter', 'order', 'autoOrder', 'page', 'limit', 'columns', 'mongoTransformer']);
         default:
             return baseOptions.concat(extraOptions);
         }
@@ -907,6 +907,8 @@ ghostBookshelf.Model = ghostBookshelf.Model.extend({
 
         if (options.order) {
             options.order = this.parseOrderOption(options.order, options.withRelated);
+        } else if (options.autoOrder) {
+            options.orderRaw = options.autoOrder;
         } else if (this.orderDefaultRaw) {
             options.orderRaw = this.orderDefaultRaw(options);
         } else if (this.orderDefaultOptions) {
