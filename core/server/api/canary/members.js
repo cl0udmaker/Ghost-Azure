@@ -7,6 +7,7 @@ const config = require('../../../shared/config');
 const models = require('../../models');
 const membersService = require('../../services/members');
 const doImport = require('../../services/members/importer');
+const memberLabelsImporter = require('../../services/members/importer/labels');
 const settingsCache = require('../../services/settings/cache');
 const {i18n} = require('../../lib/common');
 const logging = require('../../../shared/logging');
@@ -31,12 +32,15 @@ const sanitizeInput = async (members) => {
     let invalidCount = 0;
 
     const jsonSchema = require('./utils/validators/utils/json-schema');
-    const schema = require('./utils/validators/input/schemas/members-upload');
-    const definitions = require('./utils/validators/input/schemas/members');
 
     let invalidValidationCount = 0;
     try {
-        await jsonSchema.validate(schema, definitions, members);
+        await jsonSchema.validate({
+            docName: 'members',
+            method: 'upload'
+        }, {
+            data: members
+        });
     } catch (error) {
         if (error.errorDetails && error.errorDetails.length) {
             const jsonPointerIndexRegex = /\[(?<index>\d+)\]/;
@@ -125,73 +129,9 @@ const sanitizeInput = async (members) => {
     return {
         sanitized,
         invalidCount,
-        validationErrors
+        validationErrors,
+        duplicateStripeCustomersCount
     };
-};
-
-function serializeMemberLabels(labels) {
-    if (_.isString(labels)) {
-        if (labels === '') {
-            return [];
-        }
-
-        return [{
-            name: labels.trim()
-        }];
-    } else if (labels) {
-        return labels.filter((label) => {
-            return !!label;
-        }).map((label) => {
-            if (_.isString(label)) {
-                return {
-                    name: label.trim()
-                };
-            }
-            return label;
-        });
-    }
-    return [];
-}
-
-const findOrCreateLabels = async (labels, options) => {
-    const api = require('./index');
-
-    return await Promise.all(labels.map((label) => {
-        return models.Label.findOne({name: label.name}).then((existingLabel) => {
-            if (existingLabel) {
-                return existingLabel;
-            }
-
-            return api.labels.add.query({
-                data: {
-                    labels: [label]
-                },
-                options: {
-                    context: options.context
-                }
-            }).catch((error) => {
-                if (error.errorType === 'ValidationError') {
-                    return;
-                }
-
-                throw error;
-            });
-        });
-    }));
-};
-
-const getUniqueMemberLabels = (members) => {
-    const allLabels = [];
-
-    members.forEach((member) => {
-        const labels = (member.labels && member.labels.split(',')) || [];
-
-        if (labels.length) {
-            allLabels.push(...labels);
-        }
-    });
-
-    return _.uniq(allLabels);
 };
 
 module.exports = {
@@ -225,12 +165,8 @@ module.exports = {
         async query(frame) {
             frame.options.withRelated = ['labels', 'stripeSubscriptions', 'stripeSubscriptions.customer'];
             const page = await membersService.api.members.list(frame.options);
-            const members = page.data.map(model => model.toJSON(frame.options));
 
-            return {
-                members: members,
-                meta: page.meta
-            };
+            return page;
         }
     },
 
@@ -252,7 +188,7 @@ module.exports = {
                 });
             }
 
-            return model.toJSON(frame.options);
+            return model;
         }
     },
 
@@ -278,17 +214,21 @@ module.exports = {
             let member;
             frame.options.withRelated = ['stripeSubscriptions', 'stripeSubscriptions.customer'];
             try {
+                if (!membersService.config.isStripeConnected()
+                    && (frame.data.members[0].stripe_customer_id || frame.data.members[0].comped)) {
+                    const property = frame.data.members[0].comped ? 'comped' : 'stripe_customer_id';
+
+                    throw new errors.ValidationError({
+                        message: i18n.t('errors.api.members.stripeNotConnected.message'),
+                        context: i18n.t('errors.api.members.stripeNotConnected.context'),
+                        help: i18n.t('errors.api.members.stripeNotConnected.help'),
+                        property
+                    });
+                }
+
                 member = await membersService.api.members.create(frame.data.members[0], frame.options);
 
                 if (frame.data.members[0].stripe_customer_id) {
-                    if (!membersService.config.isStripeConnected()) {
-                        throw new errors.ValidationError({
-                            message: i18n.t('errors.api.members.stripeNotConnected.message'),
-                            context: i18n.t('errors.api.members.stripeNotConnected.context'),
-                            help: i18n.t('errors.api.members.stripeNotConnected.help')
-                        });
-                    }
-
                     await membersService.api.members.linkStripeCustomer(frame.data.members[0].stripe_customer_id, member);
                 }
 
@@ -300,19 +240,21 @@ module.exports = {
                     await membersService.api.sendEmailWithMagicLink({email: member.get('email'), requestedType: frame.options.email_type});
                 }
 
-                return member.toJSON(frame.options);
+                return member;
             } catch (error) {
                 if (error.code && error.message.toLowerCase().indexOf('unique') !== -1) {
                     throw new errors.ValidationError({
                         message: i18n.t('errors.models.member.memberAlreadyExists.message'),
-                        context: i18n.t('errors.models.member.memberAlreadyExists.context')
+                        context: i18n.t('errors.models.member.memberAlreadyExists.context', {
+                            action: 'add'
+                        })
                     });
                 }
 
                 // NOTE: failed to link Stripe customer/plan/subscription or have thrown custom Stripe connection error.
                 //       It's a bit ugly doing regex matching to detect errors, but it's the easiest way that works without
                 //       introducing additional logic/data format into current error handling
-                const isStripeLinkingError = error.message && (error.message.match(/customer|plan|subscription/g) || error.context === i18n.t('errors.api.members.stripeNotConnected.context'));
+                const isStripeLinkingError = error.message && (error.message.match(/customer|plan|subscription/g));
                 if (member && isStripeLinkingError) {
                     if (error.message.indexOf('customer') && error.code === 'resource_missing') {
                         error.message = `Member not imported. ${error.message}`;
@@ -345,24 +287,37 @@ module.exports = {
         },
         permissions: true,
         async query(frame) {
-            frame.options.withRelated = ['stripeSubscriptions'];
-            const member = await membersService.api.members.update(frame.data.members[0], frame.options);
+            try {
+                frame.options.withRelated = ['stripeSubscriptions'];
+                const member = await membersService.api.members.update(frame.data.members[0], frame.options);
 
-            const hasCompedSubscription = !!member.related('stripeSubscriptions').find(subscription => subscription.get('plan_nickname') === 'Complimentary');
+                const hasCompedSubscription = !!member.related('stripeSubscriptions').find(subscription => subscription.get('plan_nickname') === 'Complimentary');
 
-            if (typeof frame.data.members[0].comped === 'boolean') {
-                if (frame.data.members[0].comped && !hasCompedSubscription) {
-                    await membersService.api.members.setComplimentarySubscription(member);
-                } else if (!(frame.data.members[0].comped) && hasCompedSubscription) {
-                    await membersService.api.members.cancelComplimentarySubscription(member);
+                if (typeof frame.data.members[0].comped === 'boolean') {
+                    if (frame.data.members[0].comped && !hasCompedSubscription) {
+                        await membersService.api.members.setComplimentarySubscription(member);
+                    } else if (!(frame.data.members[0].comped) && hasCompedSubscription) {
+                        await membersService.api.members.cancelComplimentarySubscription(member);
+                    }
+
+                    await member.load(['stripeSubscriptions']);
                 }
 
-                await member.load(['stripeSubscriptions']);
+                await member.load(['stripeSubscriptions.customer']);
+
+                return member;
+            } catch (error) {
+                if (error.code && error.message.toLowerCase().indexOf('unique') !== -1) {
+                    throw new errors.ValidationError({
+                        message: i18n.t('errors.models.member.memberAlreadyExists.message'),
+                        context: i18n.t('errors.models.member.memberAlreadyExists.context', {
+                            action: 'edit'
+                        })
+                    });
+                }
+
+                throw error;
             }
-
-            await member.load(['stripeSubscriptions.customer']);
-
-            return member.toJSON(frame.options);
         }
     },
 
@@ -408,7 +363,7 @@ module.exports = {
                 });
             }
 
-            return model.toJSON(frame.options);
+            return model;
         }
     },
 
@@ -447,7 +402,10 @@ module.exports = {
 
     exportCSV: {
         options: [
-            'limit'
+            'limit',
+            'filter',
+            'search',
+            'paid'
         ],
         headers: {
             disposition: {
@@ -468,12 +426,8 @@ module.exports = {
         async query(frame) {
             frame.options.withRelated = ['labels', 'stripeSubscriptions', 'stripeSubscriptions.customer'];
             const page = await membersService.api.members.list(frame.options);
-            const members = page.data.map(model => model.toJSON(frame.options));
 
-            return {
-                members: members,
-                meta: page.meta
-            };
+            return page;
         }
     },
 
@@ -528,30 +482,17 @@ module.exports = {
             };
             let duplicateStripeCustomerIdCount = 0;
 
-            // NOTE: custom labels have to be created in advance otherwise there are conflicts
-            //       when processing member creation in parallel later on in import process
-            const importSetLabels = serializeMemberLabels(frame.data.labels);
-            await findOrCreateLabels(importSetLabels, frame.options);
-
-            // NOTE: adding an import label allows for imports to be "undone" via bulk delete
-            let importLabel;
-            if (frame.data.members.length) {
-                const siteTimezone = settingsCache.get('timezone');
-                const name = `Import ${moment().tz(siteTimezone).format('YYYY-MM-DD HH:mm')}`;
-                const result = await findOrCreateLabels([{name}], frame.options);
-                importLabel = result[0] && result[0].toJSON();
-
-                importSetLabels.push(importLabel);
-            }
-
-            // NOTE: member-specific labels have to be pre-created as they cause conflicts when processed
-            //       in parallel
-            const memberLabels = serializeMemberLabels(getUniqueMemberLabels(frame.data.members));
-            await findOrCreateLabels(memberLabels, frame.options);
+            let {importSetLabels, importLabel} = await memberLabelsImporter.handleAllLabels(
+                frame.data.labels,
+                frame.data.members,
+                settingsCache.get('timezone'),
+                frame.options
+            );
 
             return Promise.resolve().then(async () => {
-                const {sanitized, invalidCount, validationErrors} = await sanitizeInput(frame.data.members);
+                const {sanitized, invalidCount, validationErrors, duplicateStripeCustomersCount} = await sanitizeInput(frame.data.members);
                 invalid.count += invalidCount;
+                duplicateStripeCustomerIdCount = duplicateStripeCustomersCount;
 
                 if (validationErrors.length) {
                     invalid.errors.push(...validationErrors);
@@ -560,7 +501,7 @@ module.exports = {
                 return Promise.map(sanitized, ((entry) => {
                     const api = require('./index');
                     entry.labels = (entry.labels && entry.labels.split(',')) || [];
-                    const entryLabels = serializeMemberLabels(entry.labels);
+                    const entryLabels = memberLabelsImporter.serializeMemberLabels(entry.labels);
                     const mergedLabels = _.unionBy(entryLabels, importSetLabels, 'name');
 
                     cleanupUndefined(entry);
@@ -634,7 +575,7 @@ module.exports = {
 
                 invalid.errors = outputErrors;
 
-                if (imported.count === 0 && importLabel) {
+                if (imported.count === 0 && importLabel && importLabel.generated) {
                     await models.Label.destroy(Object.assign({}, {id: importLabel.id}, frame.options));
                     importLabel = null;
                 }
@@ -681,33 +622,17 @@ module.exports = {
 
             const createdBy = contextUser(frame.options);
 
-            // NOTE: custom labels have to be created in advance otherwise there are conflicts
-            //       when processing member creation in parallel later on in import process
-            const importSetLabels = serializeMemberLabels(frame.data.labels);
-
-            // NOTE: adding an import label allows for imports to be "undone" via bulk delete
-            let importLabel;
-            if (frame.data.members.length) {
-                const siteTimezone = settingsCache.get('timezone');
-                const name = `Import ${moment().tz(siteTimezone).format('YYYY-MM-DD HH:mm')}`;
-                const result = await findOrCreateLabels([{name}], frame.options);
-                importLabel = result[0] && result[0].toJSON();
-
-                importSetLabels.push(importLabel);
-            }
-
-            const importSetLabelModels = await findOrCreateLabels(importSetLabels, frame.options);
-
-            // NOTE: member-specific labels have to be pre-created as they cause conflicts when processed
-            //       in parallel
-            const memberLabels = serializeMemberLabels(getUniqueMemberLabels(frame.data.members));
-            const memberLabelModels = await findOrCreateLabels(memberLabels, frame.options);
-
-            const allLabelModels = [...importSetLabelModels, ...memberLabelModels].filter(model => model !== undefined);
+            let {allLabels, importSetLabels, importLabel} = await memberLabelsImporter.handleAllLabels(
+                frame.data.labels,
+                frame.data.members,
+                settingsCache.get('timezone'),
+                frame.options
+            );
 
             return Promise.resolve().then(async () => {
-                const {sanitized, invalidCount, validationErrors} = await sanitizeInput(frame.data.members);
+                const {sanitized, invalidCount, validationErrors, duplicateStripeCustomersCount} = await sanitizeInput(frame.data.members);
                 invalid.count += invalidCount;
+                duplicateStripeCustomerIdCount = duplicateStripeCustomersCount;
 
                 if (validationErrors.length) {
                     invalid.errors.push(...validationErrors);
@@ -715,7 +640,7 @@ module.exports = {
 
                 return doImport({
                     members: sanitized,
-                    allLabelModels,
+                    labels: allLabels,
                     importSetLabels,
                     createdBy
                 });
@@ -746,7 +671,7 @@ module.exports = {
 
                 invalid.errors = outputErrors;
 
-                if (imported.count === 0 && importLabel) {
+                if (imported.count === 0 && importLabel && importLabel.generated) {
                     await models.Label.destroy(Object.assign({}, {id: importLabel.id}, frame.options));
                     importLabel = null;
                 }

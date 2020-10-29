@@ -61,8 +61,8 @@ module.exports = function apiRoutes() {
     router.get('/settings', mw.authAdminApi, http(apiCanary.settings.browse));
     router.get('/settings/:key', mw.authAdminApi, http(apiCanary.settings.read));
     router.put('/settings', mw.authAdminApi, http(apiCanary.settings.edit));
-    router.get('/settings/members/email', http(apiCanary.settings.validateMembersFromEmail));
-    router.post('/settings/members/email', mw.authAdminApi, http(apiCanary.settings.updateMembersFromEmail));
+    router.get('/settings/members/email', http(apiCanary.settings.validateMembersEmailUpdate));
+    router.post('/settings/members/email', mw.authAdminApi, http(apiCanary.settings.updateMembersEmail));
     router.del('/settings/stripe/connect', mw.authAdminApi, http(apiCanary.settings.disconnectStripeConnectIntegration));
 
     // ## Users
@@ -246,6 +246,13 @@ module.exports = function apiRoutes() {
     // ## Emails
     router.get('/emails/:id', mw.authAdminApi, http(apiCanary.emails.read));
     router.put('/emails/:id/retry', mw.authAdminApi, http(apiCanary.emails.retry));
+
+    // ## Snippets
+    router.get('/snippets', mw.authAdminApi, http(apiCanary.snippets.browse));
+    router.get('/snippets/:id', mw.authAdminApi, http(apiCanary.snippets.read));
+    router.post('/snippets', mw.authAdminApi, http(apiCanary.snippets.add));
+    router.put('/snippets/:id', mw.authAdminApi, http(apiCanary.snippets.edit));
+    router.del('/snippets/:id', mw.authAdminApi, http(apiCanary.snippets.destroy));
 
     return router;
 };
